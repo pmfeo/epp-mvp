@@ -49,7 +49,7 @@ npm test --workspace=apps/backend -- --testPathPattern=photos.service
 
 | Module | Responsibility |
 |---|---|
-| `auth` | JWT + Google OAuth (Passport.js). 24h tokens stored in localStorage. |
+| `auth` | Supabase Auth JWT verification. A single NestJS guard validates tokens issued by Supabase using `SUPABASE_JWT_SECRET`. No custom OAuth callback — Google OAuth and email/password are handled entirely by Supabase. |
 | `events` | Event CRUD, QR generation (`qrcode` → S3), cron jobs (auto-close, ZIP processing, 30-day retention) |
 | `photos` | Guest upload orchestration, rate limiting, HEIC→JPEG conversion, review (approve/reject/reset) |
 | `moderation` | AI provider abstraction. Mock for MVP. Real provider swapped via NestJS DI (`useClass`). |
@@ -154,17 +154,49 @@ State management: Zustand. HTTP: Axios. Real-time: `socket.io-client`. Notificat
 - No guest feedback on approval/rejection — only "En revisión" after upload
 - ZIP download: async job (cron), expires 30 days after event close
 - JWT in localStorage (XSS risk acknowledged; post-MVP: httpOnly cookies)
-- Google OAuth token passed as query param to frontend (browser history exposure; post-MVP: one-time-code exchange)
+- Supabase Auth handles the Google OAuth callback — no custom redirect or token-in-query-param. `supabase-js` manages token refresh automatically.
+
+## Authentication (Supabase Auth)
+
+Google OAuth and email/password auth are **fully delegated to Supabase Auth**. The backend never issues tokens.
+
+**Frontend flow:**
+```
+Login/Register → supabase.auth.signInWithPassword() / signUp()
+Google OAuth   → supabase.auth.signInWithOAuth({ provider: 'google' })
+                 (Supabase handles the callback — no /auth/google/callback route needed)
+Post-login     → supabase.auth.getSession() → session.access_token
+               → sent as Authorization: Bearer <token> on every API request
+```
+
+**Backend guard:**
+- Verifies the JWT signature with `SUPABASE_JWT_SECRET`
+- Extracts `sub` (userId) and `email` from claims — same shape as a custom JWT
+- Attaches `{ userId, email }` to `req.user`
+
+**User table:**
+- `auth.users` lives in Supabase's internal schema
+- A `profiles` table in the public schema mirrors it via a Supabase trigger:
+  ```sql
+  CREATE TABLE profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    display_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  ```
+- `events.organizer_id` is a FK → `profiles.id`
 
 ## Environment Variables
 
 ```bash
 # apps/backend/.env
-DATABASE_URL, JWT_SECRET, JWT_EXPIRES_IN=24h
-GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL
+DATABASE_URL                          # Supabase PostgreSQL connection string
+SUPABASE_URL                          # For any server-side Supabase client usage
+SUPABASE_JWT_SECRET                   # To verify Supabase-issued JWTs in the guard
 AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET_NAME
 FRONTEND_URL
 
 # apps/frontend/.env
 VITE_API_URL, VITE_WS_URL
+VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
 ```
